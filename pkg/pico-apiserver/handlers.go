@@ -36,28 +36,34 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	// Generate session ID
 	sessionID := uuid.New().String()
 
-	// Create Kubernetes Sandbox CRD
-	sandbox, err := s.k8sClient.CreateSandbox(r.Context(), sessionID, req.Image, req.Metadata)
+	// Calculate sandbox name and namespace before creating
+	// This matches the naming in k8s_client.go CreateSandbox()
+	sandboxName := "sandbox-" + sessionID[:8]
+	namespace := s.config.Namespace
+
+	// CRITICAL: Register watcher BEFORE creating sandbox
+	// This ensures we don't miss the Running state notification
+	resultChan := s.sandboxController.WatchSandboxOnce(r.Context(), namespace, sandboxName)
+
+	// Now create Kubernetes Sandbox CRD
+	_, err := s.k8sClient.CreateSandbox(r.Context(), sessionID, req.Image, req.SSHPublicKey, req.Metadata)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "SANDBOX_CREATE_FAILED", err.Error())
 		return
 	}
 
-	resultChan := s.sandboxController.WatchSandboxOnce(sandbox.Namespace, sandbox.Name)
-	session := &Session{}
-
 	select {
 	case result := <-resultChan:
 		// Create session object
 		now := time.Now()
-		session = &Session{
+		session := &Session{
 			SessionID:      sessionID,
 			Status:         result.Status,
 			CreatedAt:      now,
 			ExpiresAt:      now.Add(time.Duration(req.TTL) * time.Second),
 			LastActivityAt: now,
 			Metadata:       req.Metadata,
-			SandboxName:    result.Name,
+			SandboxName:    sandboxName,
 		}
 
 		// Store session
@@ -144,82 +150,4 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{
 		"message": "Session deleted successfully",
 	})
-}
-
-// handleExecuteCommand handles command execution requests (via SSH proxy)
-func (s *Server) handleExecuteCommand(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	sessionID := vars["sessionId"]
-
-	session := s.sessionStore.Get(sessionID)
-	if session == nil {
-		respondError(w, http.StatusNotFound, "SESSION_NOT_FOUND", "Session not found or expired")
-		return
-	}
-
-	var req CommandRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
-		return
-	}
-
-	// TODO: Implement command execution via SSH
-	// This requires:
-	// 1. Get sandbox pod IP
-	// 2. Establish SSH connection
-	// 3. Execute command
-	// 4. Return results
-
-	respondError(w, http.StatusNotImplemented, "NOT_IMPLEMENTED", "Command execution not yet implemented")
-}
-
-// handleExecuteCode handles code execution requests
-func (s *Server) handleExecuteCode(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	sessionID := vars["sessionId"]
-
-	session := s.sessionStore.Get(sessionID)
-	if session == nil {
-		respondError(w, http.StatusNotFound, "SESSION_NOT_FOUND", "Session not found or expired")
-		return
-	}
-
-	var req CodeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
-		return
-	}
-
-	// TODO: Implement code execution
-	respondError(w, http.StatusNotImplemented, "NOT_IMPLEMENTED", "Code execution not yet implemented")
-}
-
-// handleUploadFile handles file upload requests
-func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	sessionID := vars["sessionId"]
-
-	session := s.sessionStore.Get(sessionID)
-	if session == nil {
-		respondError(w, http.StatusNotFound, "SESSION_NOT_FOUND", "Session not found or expired")
-		return
-	}
-
-	// TODO: Implement file upload (via SFTP)
-	respondError(w, http.StatusNotImplemented, "NOT_IMPLEMENTED", "File upload not yet implemented")
-}
-
-// handleDownloadFile handles file download requests
-func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	sessionID := vars["sessionId"]
-
-	session := s.sessionStore.Get(sessionID)
-	if session == nil {
-		respondError(w, http.StatusNotFound, "SESSION_NOT_FOUND", "Session not found or expired")
-		return
-	}
-
-	// TODO: Implement file download (via SFTP)
-	respondError(w, http.StatusNotImplemented, "NOT_IMPLEMENTED", "File download not yet implemented")
 }

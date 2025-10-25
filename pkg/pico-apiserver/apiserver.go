@@ -28,7 +28,7 @@ func NewServer(config *Config, sandboxController *controller.SandboxReconciler) 
 	}
 
 	// Create Kubernetes client
-	k8sClient, err := NewK8sClient(config.Kubeconfig, config.Namespace)
+	k8sClient, err := NewK8sClient(config.Namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
@@ -66,17 +66,8 @@ func (s *Server) setupRoutes() {
 	v1.HandleFunc("/sessions/{sessionId}", s.authMiddleware(s.handleDeleteSession)).Methods("DELETE")
 
 	// HTTP CONNECT tunnel endpoint - for SSH/SFTP proxy
+	// All operations (command execution, file transfer, etc.) are handled through this tunnel
 	v1.HandleFunc("/sessions/{sessionId}/tunnel", s.authMiddleware(s.handleTunnel))
-
-	// Command execution endpoint (alternative REST API)
-	v1.HandleFunc("/sessions/{sessionId}/commands", s.authMiddleware(s.handleExecuteCommand)).Methods("POST")
-
-	// File operation endpoints (alternative REST API)
-	v1.HandleFunc("/sessions/{sessionId}/files", s.authMiddleware(s.handleUploadFile)).Methods("POST")
-	v1.HandleFunc("/sessions/{sessionId}/files", s.authMiddleware(s.handleDownloadFile)).Methods("GET")
-
-	// Code execution endpoint
-	v1.HandleFunc("/sessions/{sessionId}/code", s.authMiddleware(s.handleExecuteCode)).Methods("POST")
 
 	// Logging middleware
 	s.router.Use(s.loggingMiddleware)

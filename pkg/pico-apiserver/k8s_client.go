@@ -33,21 +33,21 @@ var sandboxGVR = schema.GroupVersionResource{
 }
 
 // NewK8sClient creates a new Kubernetes client
-func NewK8sClient(kubeconfig, namespace string) (*K8sClient, error) {
+func NewK8sClient(namespace string) (*K8sClient, error) {
 	var config *rest.Config
 	var err error
 
-	if kubeconfig != "" {
-		// Use provided kubeconfig file
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	// Try in-cluster config first
+	config, err = rest.InClusterConfig()
+	if err != nil {
+		// If not in cluster, use default kubeconfig loading rules
+		// This will check KUBECONFIG env var, then ~/.kube/config
+		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+		configOverrides := &clientcmd.ConfigOverrides{}
+		kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+		config, err = kubeConfig.ClientConfig()
 		if err != nil {
-			return nil, fmt.Errorf("failed to build config from kubeconfig: %w", err)
-		}
-	} else {
-		// Use in-cluster configuration
-		config, err = rest.InClusterConfig()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+			return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
 		}
 	}
 
@@ -84,9 +84,23 @@ type SandboxInfo struct {
 }
 
 // CreateSandbox creates a new Sandbox CRD resource using the agent-sandbox types
-func (c *K8sClient) CreateSandbox(ctx context.Context, sessionID, image string, metadata map[string]interface{}) (*SandboxInfo, error) {
+func (c *K8sClient) CreateSandbox(ctx context.Context, sessionID, image, sshPublicKey string, metadata map[string]interface{}) (*SandboxInfo, error) {
 	// Use first 8 characters of session ID for sandbox name
 	sandboxName := fmt.Sprintf("sandbox-%s", sessionID[:8])
+
+	// Use default sandbox image if not specified
+	if image == "" {
+		image = "sandbox:latest"
+	}
+
+	// Prepare container environment variables
+	env := []corev1.EnvVar{}
+	if sshPublicKey != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "SSH_PUBLIC_KEY",
+			Value: sshPublicKey,
+		})
+	}
 
 	// Create Sandbox object using agent-sandbox types
 	sandbox := &agentsv1alpha1.Sandbox{
@@ -98,8 +112,9 @@ func (c *K8sClient) CreateSandbox(ctx context.Context, sessionID, image string, 
 			Name:      sandboxName,
 			Namespace: c.namespace,
 			Labels: map[string]string{
-				"session-id": sessionID,
-				"managed-by": "pico-apiserver",
+				"session-id":   sessionID,
+				"managed-by":   "pico-apiserver",
+				"sandbox-name": sandboxName,
 			},
 			Annotations: convertToStringMap(metadata),
 		},
@@ -108,8 +123,10 @@ func (c *K8sClient) CreateSandbox(ctx context.Context, sessionID, image string, 
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "sandbox",
-							Image: image,
+							Name:            "sandbox",
+							Image:           image,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Env:             env,
 						},
 					},
 				},
@@ -157,28 +174,60 @@ func (c *K8sClient) DeleteSandbox(ctx context.Context, sandboxName string) error
 
 // GetSandboxPodIP gets the IP address of the pod corresponding to the Sandbox
 func (c *K8sClient) GetSandboxPodIP(ctx context.Context, sandboxName string) (string, error) {
-	// Method 1: Find pod through label selector
-	// Assume the Sandbox controller creates a Pod with the same name as the Sandbox, or with specific labels
-	labelSelector := fmt.Sprintf("sandbox=%s", sandboxName)
+	// Try multiple methods to find the pod
 
+	// Method 1: Try to find pod by exact name (agent-sandbox controller may create pod with same name)
+	pod, err := c.clientset.CoreV1().Pods(c.namespace).Get(ctx, sandboxName, metav1.GetOptions{})
+	if err == nil {
+		// Found pod by exact name
+		return validateAndGetPodIP(pod)
+	}
+
+	// Method 2: Find pod through label selector (sandbox-name label we set)
+	labelSelector := fmt.Sprintf("sandbox-name=%s", sandboxName)
 	pods, err := c.clientset.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labelSelector,
 	})
+	if err == nil && len(pods.Items) > 0 {
+		return validateAndGetPodIP(&pods.Items[0])
+	}
+
+	// Method 3: Find pod by agent-sandbox controller labels
+	// The agent-sandbox controller typically adds labels like "sandbox.agents.x-k8s.io/name"
+	labelSelector = fmt.Sprintf("sandbox.agents.x-k8s.io/name=%s", sandboxName)
+	pods, err = c.clientset.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err == nil && len(pods.Items) > 0 {
+		return validateAndGetPodIP(&pods.Items[0])
+	}
+
+	// Method 4: Find pod by owner reference (more reliable)
+	allPods, err := c.clientset.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	if len(pods.Items) == 0 {
-		return "", fmt.Errorf("no pod found for sandbox %s", sandboxName)
+	for _, pod := range allPods.Items {
+		// Check if pod has owner reference to our sandbox
+		for _, owner := range pod.OwnerReferences {
+			if owner.Kind == "Sandbox" && owner.Name == sandboxName {
+				return validateAndGetPodIP(&pod)
+			}
+		}
 	}
 
-	pod := pods.Items[0]
+	return "", fmt.Errorf("no pod found for sandbox %s", sandboxName)
+}
 
-	// Wait for Pod to be ready and get IP
-	if pod.Status.Phase != "Running" {
+// validateAndGetPodIP validates pod status and returns IP
+func validateAndGetPodIP(pod *corev1.Pod) (string, error) {
+	// Check if Pod is running
+	if pod.Status.Phase != corev1.PodRunning {
 		return "", fmt.Errorf("pod not running yet, status: %s", pod.Status.Phase)
 	}
 
+	// Check if Pod IP is assigned
 	if pod.Status.PodIP == "" {
 		return "", fmt.Errorf("pod IP not assigned yet")
 	}
